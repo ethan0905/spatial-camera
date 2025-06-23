@@ -2,32 +2,27 @@
 Eye‑ & Hand‑Tracking Demo (macOS)
 ================================
 
-*Refactored eye‑tracking logic — July 2025*
+*Calibration update — July 2025*
 
-This version keeps the hand‑tracking path unchanged but **rewrites the gaze
-estimation pipeline** so the yellow box now reliably follows the user’s eyes in
-the webcam window.
+This release adds an **interactive eye‑calibration phase** so the yellow square
+follows your gaze far more accurately. Calibration is triggered automatically
+at startup and takes ~15 s:
 
-Key improvements
-----------------
-1. **Direct iris‑center mapping** — We map the averaged iris centres straight to
-   the webcam‑frame coordinates instead of naïvely stretching to the full
-   display resolution, which previously shoved the box off‑screen.
-2. **Head‑pose compensation lite** — We normalise the iris position by the
-   inter‑ocular vector. This makes the estimate resilient to small head turns.
-3. **Exponential smoothing** — A 20 % decay filter stabilises jitter without
-   noticeable lag.
-4. **No pyautogui dependency** — Gaze drawing is now entirely inside the
-   webcam window, so screen‑recording permission isn’t required.
-5. **Unit tests** for the new `normalised_gaze()` helper.
+1. A series of **red dots** appear one‑by‑one around the webcam window (corners
+   + edges + centre).
+2. **Look at the dot** and perform a **pinch gesture** (touch thumb & index‑tip)
+   with either hand to validate.
+3. Repeat until all dots are confirmed. The program fits an affine transform
+   and switches to live gaze tracking.
+
+Hand tracking and pinch detection reuse MediaPipe Hands, so no extra packages
+are required. Screen‑recording permission is still **not** needed.
 
 Install requirements
 --------------------
 ```bash
 python3 -m pip install opencv-python mediapipe numpy
 ```
-(Apple‑silicon wheels exist for Python 3.8–3.11. Use 3.11 for the smoothest
-experience.)
 
 Run live demo:
 ```bash
@@ -38,7 +33,7 @@ Run tests only:
 python eye_hand_tracking.py --test
 ```
 
-Press **ESC** to quit the live demo.
+Press **ESC** at any time to quit.
 """
 
 from __future__ import annotations
@@ -49,13 +44,12 @@ from collections import deque
 from typing import Deque, List, Tuple
 
 # -----------------------------------------------------------------------------
-# Stub‑out micropip in regular CPython environments (eg. when importing in Jupyter)
+# Stub‑out micropip for plain CPython
 # -----------------------------------------------------------------------------
 try:
     import micropip  # type: ignore
-except ModuleNotFoundError:  # pragma: no‑cover — we never use micropip on desktop
-    micropip = types.ModuleType("micropip")  # type: ignore
-    sys.modules["micropip"] = micropip
+except ModuleNotFoundError:  # pragma: no‑cover
+    sys.modules["micropip"] = types.ModuleType("micropip")  # type: ignore
 
 # -----------------------------------------------------------------------------
 # Third‑party deps (fail fast with a helpful message)
@@ -82,14 +76,15 @@ if missing:
     sys.exit(1)
 
 # -----------------------------------------------------------------------------
-# Constants & MediaPipe setup helpers
+# Constants & MediaPipe helpers
 # -----------------------------------------------------------------------------
 LEFT_IRIS = [474, 475, 476, 477]
 RIGHT_IRIS = [469, 470, 471, 472]
 LEFT_EYE_OUTER, RIGHT_EYE_OUTER = 33, 263
 
-GAZE_SMOOTHING_ALPHA = 0.2  # 0 ⇒ no smoothing, 1 ⇒ infinite lag
-SMOOTH_HISTORY: Deque[Tuple[float, float]] = deque(maxlen=1)  # store previous gaze
+PINCH_THRESHOLD = 0.04  # distance in normalised coords to register a pinch
+GAZE_SMOOTHING_ALPHA = 0.25
+SMOOTH_HISTORY: Deque[Tuple[float, float]] = deque(maxlen=1)
 
 mp_drawing = mp.solutions.drawing_utils  # type: ignore[attr-defined]
 mp_holistic = mp.solutions.holistic  # type: ignore[attr-defined]
@@ -99,59 +94,79 @@ mp_hands = mp.solutions.hands  # type: ignore[attr-defined]
 # Eye‑tracking helpers
 # -----------------------------------------------------------------------------
 
-def iris_center(
-    landmarks, indices: List[int], img_w: int, img_h: int
-) -> Tuple[float, float]:
-    """Return the (pixel‑x, pixel‑y) centre of the iris from landmark list."""
-    xs, ys = zip(*[(landmarks[i].x * img_w, landmarks[i].y * img_h) for i in indices])
+def iris_center(lm, idxs: List[int], w: int, h: int) -> Tuple[float, float]:
+    xs, ys = zip(*[(lm[i].x * w, lm[i].y * h) for i in idxs])
     return float(np.mean(xs)), float(np.mean(ys))
 
 
-def normalised_gaze(
-    landmarks, img_w: int, img_h: int
-) -> Tuple[float, float] | None:
-    """Compute gaze location *within the webcam frame* in pixels.
-
-    Strategy
-    --------
-    1. Get the pixel centres of left & right irises.
-    2. Compute the midpoint between the eye outer corners → pseudo head origin.
-    3. Measure the vector from that origin to the averaged iris centre.
-    4. Divide by inter‑ocular distance (eye‑corner distance) to normalise head
-       motion.
-    5. Map the [-0.3 … 0.3] normalised range to ±1/3 of the frame size — this
-       empirical scale works well at laptop‑camera distance without calibration.
-    """
-
-    # Required outer‑corner landmarks may be missing on first few frames
+def raw_gaze_vector(lm, w: int, h: int) -> Tuple[float, float] | None:
+    """Return raw normalised gaze vector (no gain/offset)."""
     try:
-        lx, ly = landmarks[LEFT_EYE_OUTER].x * img_w, landmarks[LEFT_EYE_OUTER].y * img_h
-        rx, ry = landmarks[RIGHT_EYE_OUTER].x * img_w, landmarks[RIGHT_EYE_OUTER].y * img_h
-    except IndexError:  # pragma: no‑cover
+        lx, ly = lm[LEFT_EYE_OUTER].x * w, lm[LEFT_EYE_OUTER].y * h
+        rx, ry = lm[RIGHT_EYE_OUTER].x * w, lm[RIGHT_EYE_OUTER].y * h
+    except IndexError:
         return None
 
-    inter_ocular = np.hypot(rx - lx, ry - ly)
-    if inter_ocular < 1:  # very unlikely, safeguards divide‑by‑zero
+    inter = np.hypot(rx - lx, ry - ly)
+    if inter < 1:
         return None
 
-    # Iris centres
-    ic_l = iris_center(landmarks, LEFT_IRIS, img_w, img_h)
-    ic_r = iris_center(landmarks, RIGHT_IRIS, img_w, img_h)
+    ic_l = iris_center(lm, LEFT_IRIS, w, h)
+    ic_r = iris_center(lm, RIGHT_IRIS, w, h)
     ic_mid = ((ic_l[0] + ic_r[0]) * 0.5, (ic_l[1] + ic_r[1]) * 0.5)
-
-    head_origin = ((lx + rx) * 0.5, (ly + ry) * 0.5)
-    norm_vec = ((ic_mid[0] - head_origin[0]) / inter_ocular,
-                (ic_mid[1] - head_origin[1]) / inter_ocular)
-
-    # Empirical gain — eye rotation spans roughly ±0.33 of inter‑ocular distance
-    gain = 3.0  # maps ±0.33 → ±1.0
-    gaze_px = np.clip(0.5 + norm_vec[0] * gain, 0, 1) * img_w
-    gaze_py = np.clip(0.5 + norm_vec[1] * gain, 0, 1) * img_h
-    return float(gaze_px), float(gaze_py)
+    origin = ((lx + rx) * 0.5, (ly + ry) * 0.5)
+    vec = ((ic_mid[0] - origin[0]) / inter, (ic_mid[1] - origin[1]) / inter)
+    return vec
 
 
 # -----------------------------------------------------------------------------
-# Main video loop
+# Pinch detection helper
+# -----------------------------------------------------------------------------
+
+INDEX_TIP, THUMB_TIP = 8, 4
+
+def is_pinched(hand, thresh: float = PINCH_THRESHOLD) -> bool:
+    if not hand:
+        return False
+    try:
+        d = np.hypot(
+            hand.landmark[INDEX_TIP].x - hand.landmark[THUMB_TIP].x,
+            hand.landmark[INDEX_TIP].y - hand.landmark[THUMB_TIP].y,
+        )
+        return d < thresh
+    except IndexError:
+        return False
+
+
+# -----------------------------------------------------------------------------
+# Calibration utilities
+# -----------------------------------------------------------------------------
+
+def calibration_targets(w: int, h: int) -> List[Tuple[int, int]]:
+    """Return list of pixel positions to show calibration dots (9‑point grid)."""
+    return [
+        (int(0.1 * w), int(0.1 * h)),
+        (int(0.5 * w), int(0.1 * h)),
+        (int(0.9 * w), int(0.1 * h)),
+        (int(0.9 * w), int(0.5 * h)),
+        (int(0.9 * w), int(0.9 * h)),
+        (int(0.5 * w), int(0.9 * h)),
+        (int(0.1 * w), int(0.9 * h)),
+        (int(0.1 * w), int(0.5 * h)),
+        (int(0.5 * w), int(0.5 * h)),
+    ]
+
+
+def fit_affine(xs: List[float], ys: List[float], x_targets: List[float], y_targets: List[float]):
+    """Solve pixel = a * raw + b for x & y independently."""
+    A = np.vstack([xs, np.ones(len(xs))]).T
+    (a_x, b_x), _ = np.linalg.lstsq(A, x_targets, rcond=None)[0], None  # type: ignore
+    (a_y, b_y), _ = np.linalg.lstsq(A, y_targets, rcond=None)[0], None  # type: ignore
+    return (float(a_x), float(b_x)), (float(a_y), float(b_y))
+
+
+# -----------------------------------------------------------------------------
+# Main demo with calibration
 # -----------------------------------------------------------------------------
 
 def demo() -> None:
@@ -166,7 +181,14 @@ def demo() -> None:
         refine_face_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
-    ) as holistic:  # type: ignore[call-arg]
+    ) as holistic:
+
+        # --------- Calibration phase ---------
+        calib_raw: List[Tuple[float, float]] = []
+        calib_targets = []
+        affine_x: Tuple[float, float] | None = None
+        affine_y: Tuple[float, float] | None = None
+        calib_done = False
 
         while True:
             ok, frame = cap.read()
@@ -174,43 +196,67 @@ def demo() -> None:
                 print("Camera read failed.")
                 break
 
-            frame = cv2.flip(frame, 1)  # selfie view
-            img_h, img_w, _ = frame.shape
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic.process(rgb)  # type: ignore[arg-type]
+            res = holistic.process(rgb)  # type: ignore[arg-type]
 
-            # ------------------------- Eye tracking -------------------------
-            gaze_pt: Tuple[float, float] | None = None
-            if results.face_landmarks:
-                gaze_pt = normalised_gaze(results.face_landmarks.landmark, img_w, img_h)
+            # Initialise target list once we know frame size
+            if not calib_targets:
+                calib_targets = calibration_targets(w, h)
 
-            if gaze_pt is not None:
-                # Exponential moving average smoothing
-                if not SMOOTH_HISTORY:
-                    smoothed = gaze_pt
-                else:
-                    prev = SMOOTH_HISTORY[0]
-                    smoothed = (
-                        GAZE_SMOOTHING_ALPHA * gaze_pt[0] + (1 - GAZE_SMOOTHING_ALPHA) * prev[0],
-                        GAZE_SMOOTHING_ALPHA * gaze_pt[1] + (1 - GAZE_SMOOTHING_ALPHA) * prev[1],
+            # Draw current calibration dot or gaze square depending on phase
+            if not calib_done:
+                tgt_idx = len(calib_raw)
+                tx, ty = calib_targets[tgt_idx]
+                cv2.circle(frame, (tx, ty), 10, (0, 0, 255), -1)  # red dot
+            
+            # Gaze vector and pinch detection available in both phases
+            raw_vec: Tuple[float, float] | None = None
+            if res.face_landmarks:
+                raw_vec = raw_gaze_vector(res.face_landmarks.landmark, w, h)
+
+            pinch = is_pinched(res.left_hand_landmarks) or is_pinched(res.right_hand_landmarks)
+
+            if not calib_done:
+                # Wait for pinch to capture sample
+                if pinch and raw_vec is not None:
+                    calib_raw.append(raw_vec)
+                    cv2.circle(frame, (tx, ty), 14, (0, 255, 0), 2)  # green flash
+                    if len(calib_raw) == len(calib_targets):
+                        # Fit affine transform
+                        xs, ys = zip(*calib_raw)
+                        xt, yt = zip(*calib_targets)
+                        affine_x, affine_y = fit_affine(xs, ys, xt, yt)
+                        calib_done = True
+                        print("Calibration complete! Switching to live gaze mode…")
+            else:
+                # ---------- Live tracking ----------
+                if raw_vec is not None and affine_x and affine_y:
+                    gx = affine_x[0] * raw_vec[0] + affine_x[1]
+                    gy = affine_y[0] * raw_vec[1] + affine_y[1]
+
+                    # Smooth
+                    if SMOOTH_HISTORY:
+                        prev = SMOOTH_HISTORY[0]
+                        gx = GAZE_SMOOTHING_ALPHA * gx + (1 - GAZE_SMOOTHING_ALPHA) * prev[0]
+                        gy = GAZE_SMOOTHING_ALPHA * gy + (1 - GAZE_SMOOTHING_ALPHA) * prev[1]
+                        SMOOTH_HISTORY.clear()
+                    SMOOTH_HISTORY.append((gx, gy))
+
+                    cv2.rectangle(
+                        frame,
+                        (int(gx) - 15, int(gy) - 15),
+                        (int(gx) + 15, int(gy) + 15),
+                        (0, 255, 255),
+                        2,
                     )
-                SMOOTH_HISTORY.clear()
-                SMOOTH_HISTORY.append(smoothed)
 
-                gx, gy = map(int, smoothed)
-                cv2.rectangle(
-                    frame,
-                    (gx - 15, gy - 15),
-                    (gx + 15, gy + 15),
-                    (0, 255, 255),
-                    2,
-                )
-
-            # ------------------------- Hand tracking ------------------------
-            if results.left_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore[arg-type]
-            if results.right_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore[arg-type]
+            # Draw hand landmarks regardless of phase
+            if res.left_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, res.left_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore[arg-type]
+            if res.right_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, res.right_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore[arg-type]
 
             cv2.imshow("Eye & Hand Tracking — ESC to quit", frame)
             if cv2.waitKey(5) & 0xFF == 27:
@@ -220,34 +266,24 @@ def demo() -> None:
     cv2.destroyAllWindows()
 
 # -----------------------------------------------------------------------------
-# Unit tests (run with --test)
+# Unit tests
 # -----------------------------------------------------------------------------
 
-def _test_normalised_gaze() -> None:
-    class LM:  # minimal stub for mp FaceLandmark
-        __slots__ = ("x", "y")
-        def __init__(self, x: float, y: float):
-            self.x, self.y = x, y
-
-    W, H = 1000, 1000
-    l_outer, r_outer = (300, 500), (700, 500)
-    inter = np.hypot(r_outer[0] - l_outer[0], r_outer[1] - l_outer[1])
-
-    # Create dummy landmark list length 478 filled with zeros
-    lm: List[LM] = [LM(0, 0) for _ in range(478)]
-    lm[LEFT_EYE_OUTER] = LM(l_outer[0] / W, l_outer[1] / H)
-    lm[RIGHT_EYE_OUTER] = LM(r_outer[0] / W, r_outer[1] / H)
-    for idx in LEFT_IRIS + RIGHT_IRIS:
-        lm[idx] = LM(0.5, 0.5)  # centred iris
-
-    gx, gy = normalised_gaze(lm, W, H)  # type: ignore[arg-type]
-    assert abs(gx - 500) < 1, gx
-    assert abs(gy - 500) < 1, gy
+def _test_affine() -> None:
+    xs = [0, 1]
+    xt = [100, 300]
+    ys = [0, 1]
+    yt = [200, 600]
+    (a_x, b_x), (a_y, b_y) = fit_affine(xs, ys, xt, yt)
+    assert abs(a_x * 0 + b_x - 100) < 1e-5
+    assert abs(a_x * 1 + b_x - 300) < 1e-5
+    assert abs(a_y * 0 + b_y - 200) < 1e-5
+    assert abs(a_y * 1 + b_y - 600) < 1e-5
 
 
 def _run_tests() -> None:
-    _test_normalised_gaze()
-    print("All gaze‑mapping tests passed.")
+    _test_affine()
+    print("All calibration helpers passed.")
 
 # -----------------------------------------------------------------------------
 # Entry‑point
@@ -255,7 +291,7 @@ def _run_tests() -> None:
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="Eye & Hand tracking demo")
+    p = argparse.ArgumentParser(description="Eye & Hand tracking demo with calibration")
     p.add_argument("--test", action="store_true", help="run unit tests and exit")
     args = p.parse_args()
 
