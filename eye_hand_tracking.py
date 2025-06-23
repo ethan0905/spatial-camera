@@ -2,270 +2,258 @@
 Eye‑ & Hand‑Tracking Demo (macOS)
 ================================
 
-*Quadratic calibration & reliability update — July 2025*
+Center‑Edge Calibration + Live Metrics
+--------------------------------------
 
-We’ve swapped the simple 2‑parameter affine for a **2‑D quadratic mapping** and
-expanded calibration to a 5 × 4 grid (20 dots). In practice this chops average
-error by ≈40 % and keeps accuracy consistent near the edges.
-
-**What’s new**
---------------
-1. **Quadratic transform** — Screen‑coords = *β·[1 x y x² xy y²]* for each
-   axis (6 coeffs). We solve via least‑squares after calibration.
-2. **20‑point calibration** — 5 columns × 4 rows ensures the polynomial has
-   enough samples for a good fit.
-3. All prior features (pinch cooldown, smoothing, hand landmarks) remain.
-
-Install / run / test commands are unchanged.
+* **Alternating dots:** centre → edge → centre → next edge … so you can judge
+  drift instantly.
+* **Keyboard ‘P’** acts as a virtual pinch, **‘R’** spawns an extra refine dot.
+* **Metrics overlay** shows total samples (`N`) and overall RMSE in pixels.
 """
 
 from __future__ import annotations
 
-import sys
-import types
+import math, random, sys, types
 from collections import deque
-from typing import Deque, List, Tuple
+from pathlib import Path
+from typing import List, Tuple, Deque
 
-# -----------------------------------------------------------------------------
-# Stub‑out micropip for plain CPython
-# -----------------------------------------------------------------------------
-try:
-    import micropip  # type: ignore
-except ModuleNotFoundError:  # pragma: no‑cover
-    sys.modules["micropip"] = types.ModuleType("micropip")  # type: ignore
-
-# -----------------------------------------------------------------------------
-# Third‑party deps (fail fast with a helpful message)
-# -----------------------------------------------------------------------------
-missing: List[str] = []
 try:
     import cv2  # type: ignore
-except ModuleNotFoundError:
-    missing.append("opencv-python")
-try:
     import mediapipe as mp  # type: ignore
-except ModuleNotFoundError:
-    missing.append("mediapipe")
-try:
     import numpy as np  # type: ignore
-except ModuleNotFoundError:
-    missing.append("numpy")
+except ModuleNotFoundError as e:
+    sys.exit(f"Missing dependency: {e.name}. Install with pip.")
 
-if missing:
-    print(
-        "Missing packages:\n  " + "\n  ".join(missing) +
-        "\nInstall with:\n\n    pip install " + " ".join(missing)
-    )
-    sys.exit(1)
-
-# -----------------------------------------------------------------------------
-# Constants & MediaPipe helpers
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------------
 LEFT_IRIS = [474, 475, 476, 477]
 RIGHT_IRIS = [469, 470, 471, 472]
 LEFT_EYE_OUTER, RIGHT_EYE_OUTER = 33, 263
+INDEX_TIP, THUMB_TIP = 8, 4
 
-PINCH_THRESHOLD = 0.04  # thumb–index dist
-GAZE_SMOOTHING_ALPHA = 0.3
-COOLDOWN_FRAMES = 3  # frames to suppress extra pinches
+PINCH_THRESHOLD = 0.04
+SMOOTH_WINDOW = 10
+COOLDOWN_FRAMES = 3
+PINCH_DUPLICATES = 10
+MIN_GRID_SAMPLES = 20
+DATA_PATH = Path("calibration_data.npz")
 
-SMOOTH_HISTORY: Deque[Tuple[float, float]] = deque(maxlen=1)
+KEY_ESC, KEY_PINCH, KEY_REFINE = 27, ord("p"), ord("r")
+FONT = cv2.FONT_HERSHEY_SIMPLEX  # type: ignore[attr-defined]
 
-mp_drawing = mp.solutions.drawing_utils  # type: ignore[attr-defined]
-mp_holistic = mp.solutions.holistic  # type: ignore[attr-defined]
-mp_hands = mp.solutions.hands  # type: ignore[attr-defined]
+SMOOTH_HISTORY: Deque[Tuple[float, float]] = deque(maxlen=SMOOTH_WINDOW)
 
-# -----------------------------------------------------------------------------
-# Eye‑tracking helpers
-# -----------------------------------------------------------------------------
+mp_holistic = mp.solutions.holistic
+mp_drawing = mp.solutions.drawing_utils
+mp_hands = mp.solutions.hands
 
-def iris_center(lm, idxs: List[int], w: int, h: int) -> Tuple[float, float]:
+# --------------------------------------------------------------------------------
+# Helper functions
+# --------------------------------------------------------------------------------
+
+def iris_center(lm, idxs: List[int], w: int, h: int):
     xs, ys = zip(*[(lm[i].x * w, lm[i].y * h) for i in idxs])
     return float(np.mean(xs)), float(np.mean(ys))
 
 
-def raw_gaze_vector(lm, w: int, h: int) -> Tuple[float, float] | None:
-    """Return head‑normalised raw gaze vector."""
+def roll_angle(lm, w: int, h: int):
+    lx, ly = lm[LEFT_EYE_OUTER].x * w, lm[LEFT_EYE_OUTER].y * h
+    rx, ry = lm[RIGHT_EYE_OUTER].x * w, lm[RIGHT_EYE_OUTER].y * h
+    return math.atan2(ry - ly, rx - lx)
+
+
+def raw_gaze(lm, w: int, h: int):
     try:
         lx, ly = lm[LEFT_EYE_OUTER].x * w, lm[LEFT_EYE_OUTER].y * h
         rx, ry = lm[RIGHT_EYE_OUTER].x * w, lm[RIGHT_EYE_OUTER].y * h
     except IndexError:
         return None
-    inter = np.hypot(rx - lx, ry - ly)
+    inter = math.hypot(rx - lx, ry - ly)
     if inter < 1:
         return None
     ic_l = iris_center(lm, LEFT_IRIS, w, h)
     ic_r = iris_center(lm, RIGHT_IRIS, w, h)
-    ic_mid = ((ic_l[0] + ic_r[0]) * 0.5, (ic_l[1] + ic_r[1]) * 0.5)
-    origin = ((lx + rx) * 0.5, (ly + ry) * 0.5)
-    return ((ic_mid[0] - origin[0]) / inter, (ic_mid[1] - origin[1]) / inter)
+    ic_mid = ((ic_l[0] + ic_r[0]) * .5, (ic_l[1] + ic_r[1]) * .5)
+    origin = ((lx + rx) * .5, (ly + ry) * .5)
+    vx, vy = (ic_mid[0] - origin[0]) / inter, (ic_mid[1] - origin[1]) / inter
+    th = -roll_angle(lm, w, h)
+    c, s = math.cos(th), math.sin(th)
+    return vx * c - vy * s, vx * s + vy * c
 
-# -----------------------------------------------------------------------------
-# Pinch detection helper
-# -----------------------------------------------------------------------------
-INDEX_TIP, THUMB_TIP = 8, 4
 
-def is_pinched(hand, thresh: float = PINCH_THRESHOLD) -> bool:
+def is_pinched(hand):
     if not hand:
         return False
     try:
-        d = np.hypot(
-            hand.landmark[INDEX_TIP].x - hand.landmark[THUMB_TIP].x,
-            hand.landmark[INDEX_TIP].y - hand.landmark[THUMB_TIP].y,
-        )
-        return d < thresh
+        d = math.hypot(hand.landmark[INDEX_TIP].x - hand.landmark[THUMB_TIP].x,
+                       hand.landmark[INDEX_TIP].y - hand.landmark[THUMB_TIP].y)
+        return d < PINCH_THRESHOLD
     except IndexError:
         return False
 
-# -----------------------------------------------------------------------------
-# Calibration utilities
-# -----------------------------------------------------------------------------
+# quadratic mapping
 
-def calibration_targets(w: int, h: int) -> List[Tuple[int, int]]:
-    """Return 20‑point grid (5×4) in row‑major order."""
+def _phi(x, y):
+    return [1, x, y, x * x, x * y, y * y]
+
+
+def fit_quadratic(raw: np.ndarray, tgt: np.ndarray):
+    F = np.array([_phi(*v) for v in raw])
+    bx, *_ = np.linalg.lstsq(F, tgt[:, 0], rcond=None)
+    by, *_ = np.linalg.lstsq(F, tgt[:, 1], rcond=None)
+    return bx.astype(float), by.astype(float)
+
+
+def map_quadratic(bx, by, vec):
+    f = _phi(*vec)
+    return float(np.dot(bx, f)), float(np.dot(by, f))
+
+
+def rmse(bx, by, raw, tgt):
+    if raw.size == 0:
+        return 0.0
+    pred = np.array([map_quadratic(bx, by, v) for v in raw])
+    err = np.hypot(pred[:, 0] - tgt[:, 0], pred[:, 1] - tgt[:, 1])
+    return float(np.sqrt(np.mean(err ** 2)))
+
+# targets
+
+def center_edge_seq(w, h):
     cols = np.linspace(0.1, 0.9, 5)
     rows = np.linspace(0.15, 0.85, 4)
-    return [(int(c * w), int(r * h)) for r in rows for c in cols]
+    pts = [(int(c * w), int(r * h)) for r in rows for c in cols]
+    centre = min(pts, key=lambda p: abs(p[0] - w/2) + abs(p[1] - h/2))
+    pts.remove(centre)
+    ordered = []
+    for p in pts:
+        ordered.append(centre)
+        ordered.append(p)
+    return ordered
 
 
-def _poly_features(x: float, y: float) -> List[float]:
-    """[1, x, y, x², xy, y²]"""
-    return [1.0, x, y, x * x, x * y, y * y]
+def random_target(w, h):
+    margin = 0.1
+    return int(random.uniform(margin, 1 - margin) * w), int(random.uniform(margin, 1 - margin) * h)
+
+# persistence
+
+def load_data():
+    if DATA_PATH.exists():
+        d = np.load(DATA_PATH)
+        return d['raw'], d['tgt']
+    return np.empty((0, 2)), np.empty((0, 2))
 
 
-def fit_quadratic(raw: List[Tuple[float, float]], tgt: List[Tuple[float, float]]):
-    """Return coeff vectors βx, βy (len 6 each)."""
-    F = np.array([_poly_features(x, y) for x, y in raw])  # (n, 6)
-    tx = np.array([px for px, _ in tgt])
-    ty = np.array([py for _, py in tgt])
-    beta_x, *_ = np.linalg.lstsq(F, tx, rcond=None)  # type: ignore
-    beta_y, *_ = np.linalg.lstsq(F, ty, rcond=None)  # type: ignore
-    return beta_x.astype(float), beta_y.astype(float)
+def save_data(raw, tgt):
+    np.savez(DATA_PATH, raw=raw, tgt=tgt)
 
+# --------------------------------------------------------------------------------
+# Main loop
+# --------------------------------------------------------------------------------
 
-def apply_quadratic(beta_x, beta_y, vec: Tuple[float, float]):
-    f = _poly_features(*vec)
-    gx = float(np.dot(beta_x, f))
-    gy = float(np.dot(beta_y, f))
-    return gx, gy
+def demo():
+    raw_ds, tgt_ds = load_data()
+    calib_ready = raw_ds.shape[0] >= MIN_GRID_SAMPLES
+    bx = by = None
+    current_rmse = 0.0
+    if calib_ready:
+        bx, by = fit_quadratic(raw_ds, tgt_ds)
+        current_rmse = rmse(bx, by, raw_ds, tgt_ds)
 
-# -----------------------------------------------------------------------------
-# Main demo
-# -----------------------------------------------------------------------------
-
-def demo() -> None:
-    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)  # type: ignore[attr-defined]
+    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)  # type: ignore
     if not cap.isOpened():
-        print("Cannot access camera — check permissions & connection.")
-        sys.exit(1)
+        sys.exit("Camera not available")
 
-    with mp_holistic.Holistic(
-        static_image_mode=False,
-        model_complexity=1,
-        refine_face_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as holistic:
-
-        calib_raw: List[Tuple[float, float]] = []
-        calib_tgt: List[Tuple[int, int]] = []
-        beta_x: np.ndarray | None = None
-        beta_y: np.ndarray | None = None
-        calib_done = False
-
+    with mp_holistic.Holistic(static_image_mode=False, model_complexity=1,
+                              refine_face_landmarks=True,
+                              min_detection_confidence=0.5,
+                              min_tracking_confidence=0.5) as holo:
         prev_pinched = False
         cooldown = 0
-        pending_idx = 0
+        seq, idx = [], 0
+        refine_mode, current_target = False, None
 
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             frame = cv2.flip(frame, 1)
-            h, w, _ = frame.shape
-            if not calib_tgt:
-                calib_tgt = calibration_targets(w, h)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = holistic.process(rgb)  # type: ignore[arg-type]
+            h, w = frame.shape[:2]
+            if not seq:
+                seq = center_edge_seq(w, h)
 
-            # Draw current calibration dot
-            if not calib_done:
-                tx, ty = calib_tgt[pending_idx]
-                cv2.circle(frame, (tx, ty), 10, (0, 0, 255), -1)
+            res = holo.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))  # type: ignore
+            raw_vec = raw_gaze(res.face_landmarks.landmark, w, h) if res.face_landmarks else None
 
-            raw_vec = None
-            if res.face_landmarks:
-                raw_vec = raw_gaze_vector(res.face_landmarks.landmark, w, h)
+            key = cv2.waitKey(5) & 0xFF
+            if key == KEY_ESC:
+                break
+            if key == KEY_REFINE and calib_ready and not refine_mode:
+                current_target = random_target(w, h)
+                refine_mode = True
 
-            pinched = is_pinched(res.left_hand_landmarks) or is_pinched(res.right_hand_landmarks)
-            rising_edge = pinched and not prev_pinched and cooldown == 0
+            hand_pinch = is_pinched(res.left_hand_landmarks) or is_pinched(res.right_hand_landmarks)
+            pinched = hand_pinch or (key == KEY_PINCH)
+            new_pinch = pinched and not prev_pinched and cooldown == 0
             prev_pinched = pinched
             if cooldown:
                 cooldown -= 1
 
-            if not calib_done:
-                if rising_edge and raw_vec is not None:
-                    calib_raw.append(raw_vec)
-                    cv2.circle(frame, (tx, ty), 14, (0, 255, 0), 2)
+            # draw dot
+            if not calib_ready:
+                tx, ty = seq[idx]
+                cv2.circle(frame, (tx, ty), 10, (0, 0, 255), -1)
+            elif refine_mode and current_target:
+                cv2.circle(frame, current_target, 10, (0, 0, 255), -1)
+
+            # handle pinch actions
+            if new_pinch and raw_vec is not None:
+                if not calib_ready:
+                    tgt = seq[idx]
+                    idx += 1
+                    if idx == len(seq):
+                        calib_ready = True
+                    add_sample = True
+                elif refine_mode and current_target:
+                    tgt = current_target
+                    refine_mode = False
+                    current_target = None
+                    add_sample = True
+                else:
+                    add_sample = False
+                if add_sample:
+                    raw_dup = np.tile(raw_vec, (PINCH_DUPLICATES, 1))
+                    tgt_dup = np.tile(tgt, (PINCH_DUPLICATES, 1))
+                    raw_ds = np.vstack([raw_ds, raw_dup])
+                    tgt_ds = np.vstack([tgt_ds, tgt_dup])
+                    bx, by = fit_quadratic(raw_ds, tgt_ds)
+                    save_data(raw_ds, tgt_ds)
+                    current_rmse = rmse(bx, by, raw_ds, tgt_ds)
                     cooldown = COOLDOWN_FRAMES
-                    pending_idx += 1
-                    if pending_idx == len(calib_tgt):
-                        beta_x, beta_y = fit_quadratic(calib_raw, calib_tgt)
-                        calib_done = True
-                        print("Calibration complete — quadratic mapping active…")
-            else:
-                if raw_vec is not None and beta_x is not None and beta_y is not None:
-                    gx, gy = apply_quadratic(beta_x, beta_y, raw_vec)
-                    # Smooth
-                    if SMOOTH_HISTORY:
-                        px, py = SMOOTH_HISTORY[0]
-                        gx = GAZE_SMOOTHING_ALPHA * gx + (1 - GAZE_SMOOTHING_ALPHA) * px
-                        gy = GAZE_SMOOTHING_ALPHA * gy + (1 - GAZE_SMOOTHING_ALPHA) * py
-                        SMOOTH_HISTORY.clear()
-                    SMOOTH_HISTORY.append((gx, gy))
-                    cv2.rectangle(frame, (int(gx) - 15, int(gy) - 15), (int(gx) + 15, int(gy) + 15), (0, 255, 255), 2)
 
-            # Hand overlays
+            # live tracking
+            if calib_ready and raw_vec is not None and bx is not None:
+                gx, gy = map_quadratic(bx, by, raw_vec)
+                SMOOTH_HISTORY.append((gx, gy))
+                sx, sy = np.mean(SMOOTH_HISTORY, axis=0)
+                cv2.rectangle(frame, (int(sx) - 15, int(sy) - 15), (int(sx) + 15, int(sy) + 15), (0, 255, 255), 2)
+
+            # metrics overlay
+            cv2.putText(frame, f"N:{raw_ds.shape[0]}  RMSE:{current_rmse:.1f}px", (10, 25), FONT, .6, (0, 255, 0), 2)
+
+            # hand overlay
             if res.left_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, res.left_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore[arg-type]
+                mp_drawing.draw_landmarks(frame, res.left_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore
             if res.right_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, res.right_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore[arg-type]
+                mp_drawing.draw_landmarks(frame, res.right_hand_landmarks, mp_hands.HAND_CONNECTIONS)  # type: ignore
 
-            cv2.imshow("Eye & Hand Tracking — ESC to quit", frame)
-            if cv2.waitKey(5) & 0xFF == 27:
-                break
+            cv2.imshow("Eye/Hand Tracking", frame)
 
     cap.release()
     cv2.destroyAllWindows()
 
-# -----------------------------------------------------------------------------
-# Simple tests
-# -----------------------------------------------------------------------------
-
-def _test_quadratic() -> None:
-    raw = [(0, 0), (1, 0), (0, 1), (1, 1)]
-    tgt = [(100, 200), (300, 200), (100, 600), (300, 600)]
-    bx, by = fit_quadratic(raw, tgt)
-    for (x, y), (tx, ty) in zip(raw, tgt):
-        px, py = apply_quadratic(bx, by, (x, y))
-        assert abs(px - tx) < 1e-3 and abs(py - ty) < 1e-3
-
-
-def _run_tests() -> None:
-    _test_quadratic()
-    print("Quadratic mapping tests passed.")
-
-# -----------------------------------------------------------------------------
-# Entry‑point
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 if __name__ == "__main__":
-    import argparse
-
-    p = argparse.ArgumentParser("Eye & Hand tracking demo — quadratic mapping")
-    p.add_argument("--test", action="store_true", help="run unit tests and exit")
-    args = p.parse_args()
-
-    if args.test:
-        _run_tests()
-    else:
-        demo()
+    demo()
