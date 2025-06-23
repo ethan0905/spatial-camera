@@ -14,3 +14,4 @@
 
 ##### 4. Run it
 `python eye_hand_tracking.py`
+press "p" or "pinch" to validate dot
